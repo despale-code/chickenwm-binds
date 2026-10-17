@@ -163,6 +163,8 @@ fn parse_key_to_vk(key: &str) -> Option<u32> {
         "F10" => Some(VK_F10.0 as u32),
         "F11" => Some(VK_F11.0 as u32),
         "F12" => Some(VK_F12.0 as u32),
+        // VK_SNAPSHOT
+        "PRINT" | "PRINTSCREEN" | "PRTSC" | "SNAPSHOT" => Some(0x2C),
         _ => None,
     }
 }
