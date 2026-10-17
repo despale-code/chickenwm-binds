@@ -5,6 +5,10 @@
 //! - 4.3: Throttled Mouse Resize/Move Stream paced by the Phase 3 Adaptive Frame Scheduler (`AdaptiveFrameScheduler`)
 //!        so 1000Hz–8000Hz mice never flood `SetWindowPos`.
 
+// Release builds are windowed apps: no console window when launched from the shell, a
+// hotkey or the launcher. Debug builds keep the console for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Sender};
 use chickenwm_core::bootstrap_config_and_themes;
@@ -524,6 +528,12 @@ fn execute_action(action: Action) {
         }
         Action::SummonLauncher => {
             let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::SummonLauncher);
+        }
+        Action::ToggleNotificationCenter => {
+            let _ = send_ipc_command_blocking(
+                chickenwm_core::ipc::PIPE_NAME_NOTIFY,
+                &IpcCommand::ToggleNotificationCenter,
+            );
         }
         // `exit` must reach the daemon so it shuts every module down; sent to the WM alone,
         // the daemon's watchdog would just respawn it.
