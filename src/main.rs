@@ -9,6 +9,8 @@
 // hotkey or the launcher. Debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cheatsheet;
+
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Sender};
 use chickenwm_core::bootstrap_config_and_themes;
@@ -24,6 +26,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::Instant;
 use tracing::{info, warn};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::{
@@ -44,6 +47,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
+const CHAIN_CHORD_TIMEOUT_MS: u128 = 2000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainFollower {
+    req_super: Option<bool>,
+    req_ctrl: bool,
+    req_alt: bool,
+    req_shift: bool,
+    vk: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingChain {
+    req_super: bool,
+    req_ctrl: bool,
+    req_alt: bool,
+    req_shift: bool,
+    leader_vk: u32,
+    submap: String,
+    armed_at: Instant,
+}
+
 #[derive(Debug, Clone)]
 struct CompiledBind {
     kind: BindKind,
@@ -51,7 +76,9 @@ struct CompiledBind {
     req_ctrl: bool,
     req_alt: bool,
     req_shift: bool,
-    vk: u32,       // Virtual-Key code or mouse button id (272 = LMB, 273 = RMB)
+    vk: u32, // Virtual-Key code or mouse button id (272 = LMB, 273 = RMB)
+    chain_next: Option<ChainFollower>,
+    submap: String,
     action: Action,
 }
 
@@ -76,6 +103,9 @@ struct HookState {
     drag_in_flight: AtomicBool,
 
     binds: RwLock<Vec<CompiledBind>>,
+    raw_rules: RwLock<Vec<BindRule>>,
+    active_submap: RwLock<String>,
+    pending_chain: RwLock<Option<PendingChain>>,
     dispatch_tx: OnceLock<Sender<Action>>,
     pacer_control: OnceLock<Arc<FramePacerControl>>,
 }
@@ -165,16 +195,49 @@ fn parse_key_to_vk(key: &str) -> Option<u32> {
         "F12" => Some(VK_F12.0 as u32),
         // VK_SNAPSHOT
         "PRINT" | "PRINTSCREEN" | "PRTSC" | "SNAPSHOT" => Some(0x2C),
+        // VK_OEM_2 ('/' / '?')
+        "SLASH" | "QUESTION" | "/" | "?" => Some(0xBF),
         _ => None,
     }
 }
 
+fn parse_key_or_chain(key_spec: &str) -> Option<(u32, Option<ChainFollower>)> {
+    if let Some((leader_raw, follower_raw)) = key_spec.split_once('>') {
+        let leader_vk = parse_key_to_vk(leader_raw.trim())?;
+        let follower_str = follower_raw.trim();
+        let (f_mods, f_key) = if let Some(idx) = follower_str.rfind(|c: char| c.is_whitespace() || c == '+') {
+            (&follower_str[..idx], &follower_str[idx + 1..])
+        } else {
+            ("", follower_str)
+        };
+        let (has_super, req_ctrl, req_alt, req_shift) = parse_mods(f_mods);
+        let follower_vk = parse_key_to_vk(f_key)?;
+        Some((
+            leader_vk,
+            Some(ChainFollower {
+                // If the follower didn't explicitly require Super, accept it whether Super is still held from the leader or released.
+                req_super: if has_super { Some(true) } else { None },
+                req_ctrl,
+                req_alt,
+                req_shift,
+                vk: follower_vk,
+            }),
+        ))
+    } else {
+        Some((parse_key_to_vk(key_spec)?, None))
+    }
+}
+
 fn compile_binds(rules: &[BindRule]) -> Vec<CompiledBind> {
-    let mut out = Vec::with_capacity(rules.len());
+    let mut out = Vec::with_capacity(rules.len() + 10);
+    let mut has_resize_submap = false;
     for r in rules {
+        if r.submap.eq_ignore_ascii_case("resize") {
+            has_resize_submap = true;
+        }
         let (req_super, req_ctrl, req_alt, req_shift) = parse_mods(&r.mods);
-        if let (Some(vk), Some(action)) = (
-            parse_key_to_vk(&r.key),
+        if let (Some((vk, chain_next)), Some(action)) = (
+            parse_key_or_chain(&r.key),
             Action::parse_dispatcher(&r.dispatcher, &r.arg),
         ) {
             out.push(CompiledBind {
@@ -184,8 +247,40 @@ fn compile_binds(rules: &[BindRule]) -> Vec<CompiledBind> {
                 req_alt,
                 req_shift,
                 vk,
+                chain_next,
+                submap: r.submap.to_ascii_lowercase(),
                 action,
             });
+        }
+    }
+    // Built-in default `resize` modal layer if the user config hasn't defined custom `submap = resize` rules.
+    if !has_resize_submap {
+        let defaults = [
+            (BindKind::Repeat, "LEFT", Action::ResizeActive { dx: -40, dy: 0 }),
+            (BindKind::Repeat, "RIGHT", Action::ResizeActive { dx: 40, dy: 0 }),
+            (BindKind::Repeat, "UP", Action::ResizeActive { dx: 0, dy: -40 }),
+            (BindKind::Repeat, "DOWN", Action::ResizeActive { dx: 0, dy: 40 }),
+            (BindKind::Repeat, "H", Action::ResizeActive { dx: -40, dy: 0 }),
+            (BindKind::Repeat, "L", Action::ResizeActive { dx: 40, dy: 0 }),
+            (BindKind::Repeat, "K", Action::ResizeActive { dx: 0, dy: -40 }),
+            (BindKind::Repeat, "J", Action::ResizeActive { dx: 0, dy: 40 }),
+            (BindKind::Press, "ESCAPE", Action::Submap("reset".to_string())),
+            (BindKind::Press, "RETURN", Action::Submap("reset".to_string())),
+        ];
+        for (kind, key, action) in defaults {
+            if let Some(vk) = parse_key_to_vk(key) {
+                out.push(CompiledBind {
+                    kind,
+                    req_super: false,
+                    req_ctrl: false,
+                    req_alt: false,
+                    req_shift: false,
+                    vk,
+                    chain_next: None,
+                    submap: "resize".to_string(),
+                    action,
+                });
+            }
         }
     }
     out
@@ -302,15 +397,89 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 return LRESULT(1);
             }
 
-            // Match against configured ChickenWM keybinds
+            // Dismiss cheat-sheet overlay on Escape
+            if is_down && vk == VK_ESCAPE.0 as u32 && cheatsheet::close_cheatsheet_if_open() {
+                return LRESULT(1);
+            }
+
+            // 1. Check pending chain chord follower (`Mod+K, then key`)
+            let active_chain = st.pending_chain.read().clone();
+            if let Some(chain) = active_chain {
+                if chain.armed_at.elapsed().as_millis() <= CHAIN_CHORD_TIMEOUT_MS {
+                    if is_down {
+                        *st.pending_chain.write() = None;
+                        if vk == VK_ESCAPE.0 as u32 {
+                            return LRESULT(1);
+                        }
+                        let binds = st.binds.read();
+                        for b in binds.iter() {
+                            if b.submap == chain.submap
+                                && b.vk == chain.leader_vk
+                                && b.req_super == chain.req_super
+                                && b.req_ctrl == chain.req_ctrl
+                                && b.req_alt == chain.req_alt
+                                && b.req_shift == chain.req_shift
+                            {
+                                if let Some(ref f) = b.chain_next {
+                                    if (f.vk == vk || f.vk == normalized_vk)
+                                        && f.req_ctrl == cur_ctrl
+                                        && f.req_alt == cur_alt
+                                        && f.req_shift == cur_shift
+                                        && f.req_super.map_or(true, |s| s == cur_super)
+                                    {
+                                        if cur_super {
+                                            st.super_chord_used.store(true, Ordering::SeqCst);
+                                            suppress_windows_start_menu_tap();
+                                        }
+                                        if let Some(tx) = st.dispatch_tx.get() {
+                                            let _ = tx.send(b.action.clone());
+                                        }
+                                        return LRESULT(1);
+                                    }
+                                }
+                            }
+                        }
+                        return LRESULT(1);
+                    } else if is_up {
+                        return LRESULT(1);
+                    }
+                } else {
+                    *st.pending_chain.write() = None;
+                }
+            }
+
+            // 2. Match against configured ChickenWM keybinds in the active modal layer (`submap`)
+            let cur_submap = st.active_submap.read().clone();
             let binds = st.binds.read();
             for b in binds.iter() {
-                if (b.vk == vk || b.vk == normalized_vk)
+                if b.submap == cur_submap
+                    && (b.vk == vk || b.vk == normalized_vk)
                     && b.req_super == cur_super
                     && b.req_ctrl == cur_ctrl
                     && b.req_alt == cur_alt
                     && b.req_shift == cur_shift
                 {
+                    if b.chain_next.is_some() {
+                        if is_down {
+                            if cur_super {
+                                st.super_chord_used.store(true, Ordering::SeqCst);
+                                suppress_windows_start_menu_tap();
+                            }
+                            *st.pending_chain.write() = Some(PendingChain {
+                                req_super: cur_super,
+                                req_ctrl: cur_ctrl,
+                                req_alt: cur_alt,
+                                req_shift: cur_shift,
+                                leader_vk: b.vk,
+                                submap: cur_submap,
+                                armed_at: Instant::now(),
+                            });
+                            return LRESULT(1);
+                        } else if is_up {
+                            return LRESULT(1);
+                        }
+                    }
+
                     let should_fire = match b.kind {
                         BindKind::Press | BindKind::Repeat => is_down,
                         BindKind::Release => is_up,
@@ -332,6 +501,14 @@ unsafe extern "system" fn low_level_keyboard_proc(
                     }
                 }
             }
+
+            // 3. Always allow Escape to exit a non-default modal layer even if not explicitly bound
+            if !cur_submap.is_empty() && is_down && vk == VK_ESCAPE.0 as u32 {
+                if let Some(tx) = st.dispatch_tx.get() {
+                    let _ = tx.send(Action::Submap("reset".to_string()));
+                }
+                return LRESULT(1);
+            }
         }
 
         CallNextHookEx(None, n_code, w_param, l_param)
@@ -348,6 +525,7 @@ unsafe extern "system" fn low_level_mouse_proc(
             let ms = &*(l_param.0 as *const MSLLHOOKSTRUCT);
             let msg = w_param.0 as u32;
             let st = state();
+
             use windows::Win32::UI::Input::KeyboardAndMouse::{
                 GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
             };
@@ -537,6 +715,24 @@ fn execute_action(action: Action) {
                 &IpcCommand::ToggleNotificationCenter,
             );
         }
+        Action::Submap(ref name) => {
+            let st = state();
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("reset") {
+                info!("Exiting modal submap layer");
+                st.active_submap.write().clear();
+            } else {
+                let target = trimmed.to_ascii_lowercase();
+                info!("Entering modal submap layer: {}", target);
+                *st.active_submap.write() = target;
+            }
+        }
+        Action::ShowBindsCheatSheet => {
+            let st = state();
+            let rules = st.raw_rules.read().clone();
+            let active = st.active_submap.read().clone();
+            cheatsheet::toggle_cheatsheet_overlay(rules, active);
+        }
         // `exit` must reach the daemon so it shuts every module down; sent to the WM alone,
         // the daemon's watchdog would just respawn it.
         Action::Exit => {
@@ -557,6 +753,7 @@ fn execute_action(action: Action) {
 
 fn apply_config(cfg: &HyprConfig) {
     let st = state();
+    *st.raw_rules.write() = cfg.binds.clone();
     *st.binds.write() = compile_binds(&cfg.binds);
     if let Some(pacer) = st.pacer_control.get() {
         pacer.set_fps_limit(if cfg.misc.fps_limit == 0 {
@@ -676,4 +873,49 @@ fn main() -> Result<()> {
 
     warn!("chickenwm-binds message loop exited.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chickenwm_core::config::{ConfigDocument, DEFAULT_CHICKENWM_CONF};
+
+    #[test]
+    fn compile_binds_parses_chain_chords_and_modal_layers() {
+        let cfg = ConfigDocument::parse(DEFAULT_CHICKENWM_CONF)
+            .expect("parse default config")
+            .compile();
+        let compiled = compile_binds(&cfg.binds);
+
+        // Verify chain chord `SUPER, K > R -> submap resize`
+        let chain_resize = compiled
+            .iter()
+            .find(|b| matches!(&b.action, Action::Submap(s) if s == "resize") && b.chain_next.is_some())
+            .expect("should compile K > R chain chord");
+        assert!(chain_resize.req_super);
+        assert_eq!(chain_resize.vk, VK_K.0 as u32);
+        let follower = chain_resize.chain_next.as_ref().unwrap();
+        assert_eq!(follower.vk, VK_R.0 as u32);
+        assert_eq!(follower.req_super, None);
+
+        // Verify modal layer `submap = resize` binds
+        assert!(compiled.iter().any(|b| {
+            b.submap == "resize"
+                && b.vk == VK_H.0 as u32
+                && matches!(b.action, Action::ResizeActive { dx: -40, dy: 0 })
+        }));
+    }
+
+    #[test]
+    fn cheatsheet_sections_group_binds_and_mark_active_submap() {
+        let cfg = ConfigDocument::parse(DEFAULT_CHICKENWM_CONF)
+            .expect("parse default config")
+            .compile();
+        let sections = cheatsheet::build_cheatsheet_sections(&cfg.binds, "resize");
+        assert!(sections.iter().any(|s| s.title == "Apps & Shell"));
+        assert!(sections.iter().any(|s| s.title == "Chain Chords"));
+        assert!(sections
+            .iter()
+            .any(|s| s.title == "Modal Layer: resize (ACTIVE)"));
+    }
 }
