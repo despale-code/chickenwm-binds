@@ -21,8 +21,8 @@ use chickenwm_core::frame_scheduler::{AdaptiveFrameScheduler, FramePacerControl}
 use chickenwm_core::handles::SafeHhook;
 use chickenwm_core::init_tracing;
 use chickenwm_core::ipc::{
-    send_ipc_command_blocking, Action, IpcCommand, PIPE_NAME_DAEMON, PIPE_NAME_LAUNCHER,
-    PIPE_NAME_NOTIFY, PIPE_NAME_WM,
+    send_ipc_command_blocking, Action, IpcCommand, PersistentIpcClient, PIPE_NAME_DAEMON,
+    PIPE_NAME_LAUNCHER, PIPE_NAME_NOTIFY, PIPE_NAME_WM,
 };
 use parking_lot::RwLock;
 use std::process::Command;
@@ -823,15 +823,20 @@ fn main() -> Result<()> {
     thread::Builder::new()
         .name("chickenwm-binds-dispatcher".to_string())
         .spawn(move || {
+            let mut wm_client = PersistentIpcClient::new(PIPE_NAME_WM);
             while let Ok(action) = rx.recv() {
                 let is_drag_update = matches!(action, Action::MouseDragWindow { .. });
-                execute_action(action);
                 if is_drag_update {
+                    if wm_client.send(&IpcCommand::Dispatch(action.clone())).is_err() {
+                        execute_action(action);
+                    }
                     let st = state();
                     st.drag_in_flight.store(false, Ordering::Release);
                     if let Some(pacer) = st.pacer_control.get() {
                         pacer.wake();
                     }
+                } else {
+                    execute_action(action);
                 }
             }
         })?;
@@ -849,7 +854,7 @@ fn main() -> Result<()> {
                 let is_resize = st.dragging_resize.load(Ordering::Relaxed);
                 let active = is_move || is_resize;
 
-                let _dt = scheduler.wait_for_next_frame(active);
+                let _dt = scheduler.wait_for_next_frame_timer(active);
                 // Re-read after the frame wait: the button may have been released meanwhile, and
                 // an update sent after MouseDragEnd would reach the WM as a stale straggler.
                 let is_resize = st.dragging_resize.load(Ordering::Acquire);
