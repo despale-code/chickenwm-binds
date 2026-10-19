@@ -20,7 +20,10 @@ use chickenwm_core::failsafe::{spawn_emergency_failsafe_thread, trigger_emergenc
 use chickenwm_core::frame_scheduler::{AdaptiveFrameScheduler, FramePacerControl};
 use chickenwm_core::handles::SafeHhook;
 use chickenwm_core::init_tracing;
-use chickenwm_core::ipc::{send_ipc_command_blocking, Action, IpcCommand, PIPE_NAME_DAEMON, PIPE_NAME_WM};
+use chickenwm_core::ipc::{
+    send_ipc_command_blocking, Action, IpcCommand, PIPE_NAME_DAEMON, PIPE_NAME_LAUNCHER,
+    PIPE_NAME_NOTIFY, PIPE_NAME_WM,
+};
 use parking_lot::RwLock;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -667,13 +670,35 @@ fn shell_open(target: &str, params: &str) -> bool {
     result.0 as isize > 32
 }
 
+fn resolve_program_path(program: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(program);
+    if p.is_absolute() || p.exists() {
+        return p.to_path_buf();
+    }
+    if let Ok(mut exe_dir) = std::env::current_exe() {
+        exe_dir.pop();
+        let sibling = exe_dir.join(program);
+        if sibling.exists() {
+            return sibling;
+        }
+        if !program.ends_with(".exe") {
+            let sibling_exe = exe_dir.join(format!("{program}.exe"));
+            if sibling_exe.exists() {
+                return sibling_exe;
+            }
+        }
+    }
+    p.to_path_buf()
+}
+
 fn execute_action(action: Action) {
     match action {
         Action::Exec(ref cmd_line) => {
             info!("Executing keybind command: {}", cmd_line);
             let parts: Vec<&str> = cmd_line.split_whitespace().collect();
             if let Some((program, args)) = parts.split_first() {
-                if let Err(e) = Command::new(program).args(args).spawn() {
+                let resolved = resolve_program_path(program);
+                if let Err(e) = Command::new(&resolved).args(args).spawn() {
                     // Not a runnable program: let the shell open it instead, which covers URIs
                     // (`ms-screenclip:`, `ms-settings:`), documents and shortcuts.
                     if !shell_open(program, &args.join(" ")) {
@@ -683,37 +708,40 @@ fn execute_action(action: Action) {
             }
         }
         Action::OpenFiles(ref path) => {
-            let mut cmd = Command::new("chickenwm-files.exe");
+            let resolved = resolve_program_path("chickenwm-files.exe");
+            let mut cmd = Command::new(resolved);
             if let Some(p) = path {
                 cmd.arg(p);
             }
-            if cmd.spawn().is_err() {
-                if let Ok(mut exe) = std::env::current_exe() {
-                    exe.set_file_name("chickenwm-files.exe");
-                    let mut c = Command::new(exe);
-                    if let Some(p) = path {
-                        c.arg(p);
-                    }
-                    let _ = c.spawn();
-                }
+            if let Err(e) = cmd.spawn() {
+                warn!("open files failed: {e}");
             }
         }
         Action::OpenSettings => {
-            if Command::new("chickenwm-settings.exe").spawn().is_err() {
-                if let Ok(mut exe) = std::env::current_exe() {
-                    exe.set_file_name("chickenwm-settings.exe");
-                    let _ = Command::new(exe).spawn();
-                }
+            let resolved = resolve_program_path("chickenwm-settings.exe");
+            if let Err(e) = Command::new(resolved).spawn() {
+                warn!("open settings failed: {e}");
             }
         }
         Action::SummonLauncher => {
-            let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::SummonLauncher);
+            if send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::SummonLauncher).is_err() {
+                if send_ipc_command_blocking(PIPE_NAME_LAUNCHER, &IpcCommand::SummonLauncher).is_err() {
+                    let resolved = resolve_program_path("chickenwm-launcher.exe");
+                    if let Err(e) = Command::new(resolved).spawn() {
+                        warn!("summon launcher failed: {e}");
+                    }
+                }
+            }
         }
         Action::ToggleNotificationCenter => {
-            let _ = send_ipc_command_blocking(
-                chickenwm_core::ipc::PIPE_NAME_NOTIFY,
-                &IpcCommand::ToggleNotificationCenter,
-            );
+            if send_ipc_command_blocking(PIPE_NAME_NOTIFY, &IpcCommand::ToggleNotificationCenter).is_err() {
+                if send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::ToggleNotificationCenter).is_err() {
+                    let resolved = resolve_program_path("chickenwm-notify.exe");
+                    if let Err(e) = Command::new(resolved).spawn() {
+                        warn!("toggle notifications failed: {e}");
+                    }
+                }
+            }
         }
         Action::Submap(ref name) => {
             let st = state();
