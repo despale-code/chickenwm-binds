@@ -659,15 +659,13 @@ unsafe extern "system" fn low_level_mouse_proc(
     }
 }
 
-/// `ShellExecuteW(open)`; true on success (the API returns a value > 32).
+/// Launches `target` with `params`. When ChickenWM is elevated, de-elevates so apps
+/// run with standard user privileges.
 fn shell_open(target: &str, params: &str) -> bool {
-    use windows::core::{w, HSTRING};
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    let target = HSTRING::from(target);
-    let params = HSTRING::from(params);
-    let result = unsafe { ShellExecuteW(None, w!("open"), &target, &params, None, SW_SHOWNORMAL) };
-    result.0 as isize > 32
+    let target_path = std::path::Path::new(target);
+    let args = if params.trim().is_empty() { None } else { Some(params) };
+    chickenwm_core::elevation::shell_open_unelevated(target_path, args, None);
+    true
 }
 
 fn resolve_program_path(program: &str) -> std::path::PathBuf {
@@ -698,7 +696,10 @@ fn execute_action(action: Action) {
             let parts: Vec<&str> = cmd_line.split_whitespace().collect();
             if let Some((program, args)) = parts.split_first() {
                 let resolved = resolve_program_path(program);
-                if let Err(e) = Command::new(&resolved).args(args).spawn() {
+                let args_str = if args.is_empty() { None } else { Some(args.join(" ")) };
+                if chickenwm_core::elevation::is_elevated() {
+                    chickenwm_core::elevation::shell_open_unelevated(&resolved, args_str.as_deref(), None);
+                } else if let Err(e) = Command::new(&resolved).args(args).spawn() {
                     // Not a runnable program: let the shell open it instead, which covers URIs
                     // (`ms-screenclip:`, `ms-settings:`), documents and shortcuts.
                     if !shell_open(program, &args.join(" ")) {
