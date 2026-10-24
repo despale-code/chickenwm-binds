@@ -724,6 +724,25 @@ fn execute_action(action: Action) {
                 }
             }
         }
+        Action::ToggleDownloaderCenter => {
+            if send_ipc_command_blocking(
+                chickenwm_core::ipc::PIPE_NAME_DOWNLOADER,
+                &IpcCommand::ToggleDownloaderCenter,
+            )
+            .is_err()
+            {
+                if send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::ToggleDownloaderCenter)
+                    .is_err()
+                {
+                    let resolved = resolve_program_path("chickenwm-downloader.exe");
+                    chickenwm_core::elevation::shell_open_unelevated(
+                        &resolved,
+                        Some("--toggle"),
+                        None,
+                    );
+                }
+            }
+        }
         Action::Submap(ref name) => {
             let st = state();
             let trimmed = name.trim();
@@ -807,14 +826,24 @@ fn main() -> Result<()> {
             let mut wm_client = PersistentIpcClient::new(PIPE_NAME_WM);
             while let Ok(action) = rx.recv() {
                 let is_drag_update = matches!(action, Action::MouseDragWindow { .. });
-                if is_drag_update {
+                let use_persistent_wm = matches!(
+                    action,
+                    Action::MouseDragStart { .. }
+                        | Action::MouseDragWindow { .. }
+                        | Action::MouseDragEnd { .. }
+                        | Action::ResizeActive { .. }
+                        | Action::MoveActive { .. }
+                );
+                if use_persistent_wm {
                     if wm_client.send(&IpcCommand::Dispatch(action.clone())).is_err() {
                         execute_action(action);
                     }
-                    let st = state();
-                    st.drag_in_flight.store(false, Ordering::Release);
-                    if let Some(pacer) = st.pacer_control.get() {
-                        pacer.wake();
+                    if is_drag_update {
+                        let st = state();
+                        st.drag_in_flight.store(false, Ordering::Release);
+                        if let Some(pacer) = st.pacer_control.get() {
+                            pacer.wake();
+                        }
                     }
                 } else {
                     execute_action(action);
@@ -822,21 +851,27 @@ fn main() -> Result<()> {
             }
         })?;
 
-    // Phase 4.3: Spawn Throttled Mouse Resize/Move Stream synced to Phase 3 Adaptive Frame Scheduler
+    // Phase 4.3: Spawn Low-Latency Mouse Resize/Move Stream
     let tx_mouse = tx.clone();
     let pacer_mouse = Arc::clone(&pacer_control);
     thread::Builder::new()
         .name("chickenwm-binds-mouse-stream".to_string())
         .spawn(move || {
-            let mut scheduler = AdaptiveFrameScheduler::new(pacer_mouse);
             loop {
                 let st = state();
                 let is_move = st.dragging_move.load(Ordering::Relaxed);
                 let is_resize = st.dragging_resize.load(Ordering::Relaxed);
                 let active = is_move || is_resize;
 
-                let _dt = scheduler.wait_for_next_frame_timer(active);
-                // Re-read after the frame wait: the button may have been released meanwhile, and
+                if !active {
+                    pacer_mouse.wait_until_woken();
+                } else if st.drag_in_flight.load(Ordering::Acquire)
+                    || !st.drag_dirty.load(Ordering::Acquire)
+                {
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+
+                // Re-read: the button may have been released meanwhile, and
                 // an update sent after MouseDragEnd would reach the WM as a stale straggler.
                 let is_resize = st.dragging_resize.load(Ordering::Acquire);
                 let active = is_resize || st.dragging_move.load(Ordering::Acquire);
