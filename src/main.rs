@@ -697,40 +697,22 @@ fn execute_action(action: Action) {
             if let Some((program, args)) = parts.split_first() {
                 let resolved = resolve_program_path(program);
                 let args_str = if args.is_empty() { None } else { Some(args.join(" ")) };
-                if chickenwm_core::elevation::is_elevated() {
-                    chickenwm_core::elevation::shell_open_unelevated(&resolved, args_str.as_deref(), None);
-                } else if let Err(e) = Command::new(&resolved).args(args).spawn() {
-                    // Not a runnable program: let the shell open it instead, which covers URIs
-                    // (`ms-screenclip:`, `ms-settings:`), documents and shortcuts.
-                    if !shell_open(program, &args.join(" ")) {
-                        warn!("exec failed for `{cmd_line}`: {e}");
-                    }
-                }
+                chickenwm_core::elevation::shell_open_unelevated(&resolved, args_str.as_deref(), None);
             }
         }
         Action::OpenFiles(ref path) => {
             let resolved = resolve_program_path("chickenwm-files.exe");
-            let mut cmd = Command::new(resolved);
-            if let Some(p) = path {
-                cmd.arg(p);
-            }
-            if let Err(e) = cmd.spawn() {
-                warn!("open files failed: {e}");
-            }
+            chickenwm_core::elevation::shell_open_unelevated(&resolved, path.as_deref(), None);
         }
         Action::OpenSettings => {
             let resolved = resolve_program_path("chickenwm-settings.exe");
-            if let Err(e) = Command::new(resolved).spawn() {
-                warn!("open settings failed: {e}");
-            }
+            chickenwm_core::elevation::shell_open_unelevated(&resolved, None, None);
         }
         Action::SummonLauncher => {
             if send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::SummonLauncher).is_err() {
                 if send_ipc_command_blocking(PIPE_NAME_LAUNCHER, &IpcCommand::SummonLauncher).is_err() {
                     let resolved = resolve_program_path("chickenwm-launcher.exe");
-                    if let Err(e) = Command::new(resolved).spawn() {
-                        warn!("summon launcher failed: {e}");
-                    }
+                    chickenwm_core::elevation::shell_open_unelevated(&resolved, None, None);
                 }
             }
         }
@@ -738,9 +720,7 @@ fn execute_action(action: Action) {
             if send_ipc_command_blocking(PIPE_NAME_NOTIFY, &IpcCommand::ToggleNotificationCenter).is_err() {
                 if send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::ToggleNotificationCenter).is_err() {
                     let resolved = resolve_program_path("chickenwm-notify.exe");
-                    if let Err(e) = Command::new(resolved).spawn() {
-                        warn!("toggle notifications failed: {e}");
-                    }
+                    chickenwm_core::elevation::shell_open_unelevated(&resolved, None, None);
                 }
             }
         }
