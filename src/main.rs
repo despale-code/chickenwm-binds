@@ -99,10 +99,6 @@ struct HookState {
     drag_start_y: AtomicI32,
     drag_curr_x: AtomicI32,
     drag_curr_y: AtomicI32,
-    drag_dirty: AtomicBool,
-    /// A `MouseDragWindow` is queued or being sent to the WM; newer cursor positions
-    /// wait (coalesced) instead of piling up behind the IPC round-trip.
-    drag_in_flight: AtomicBool,
 
     binds: RwLock<Vec<CompiledBind>>,
     raw_rules: RwLock<Vec<BindRule>>,
@@ -348,9 +344,10 @@ unsafe extern "system" fn low_level_keyboard_proc(
                     st.super_chord_used.store(false, Ordering::SeqCst);
                 } else if is_up {
                     st.super_down.store(false, Ordering::SeqCst);
-                    // Always suppress the Windows Start Menu on Win key release so neither
-                    // standalone taps nor Super+Mouse drags ever pop up Start Menu.
-                    suppress_windows_start_menu_tap();
+                    if !st.super_chord_used.load(Ordering::SeqCst) {
+                        // Consume standalone Win key tap so Start Menu does not steal focus
+                        suppress_windows_start_menu_tap();
+                    }
                 }
                 return CallNextHookEx(None, n_code, w_param, l_param);
             }
@@ -540,25 +537,23 @@ unsafe extern "system" fn low_level_mouse_proc(
             let msg = w_param.0 as u32;
             let st = state();
 
-            use windows::Win32::UI::Input::KeyboardAndMouse::{
-                GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
-            };
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
             let hw_super = (GetAsyncKeyState(VK_LWIN.0 as i32) as u16 & 0x8000) != 0
                 || (GetAsyncKeyState(VK_RWIN.0 as i32) as u16 & 0x8000) != 0;
             if !hw_super {
                 st.super_down.store(false, Ordering::SeqCst);
             }
-            let cur_super = hw_super;
+            let cur_super = st.super_down.load(Ordering::Relaxed) || hw_super;
 
             match msg {
                 WM_LBUTTONDOWN if cur_super => {
                     st.super_chord_used.store(true, Ordering::SeqCst);
+                    suppress_windows_start_menu_tap();
                     st.drag_start_x.store(ms.pt.x, Ordering::SeqCst);
                     st.drag_start_y.store(ms.pt.y, Ordering::SeqCst);
                     st.drag_curr_x.store(ms.pt.x, Ordering::SeqCst);
                     st.drag_curr_y.store(ms.pt.y, Ordering::SeqCst);
                     st.dragging_move.store(true, Ordering::SeqCst);
-                    st.drag_dirty.store(false, Ordering::SeqCst);
                     if let Some(tx) = st.dispatch_tx.get() {
                         let _ = tx.send(Action::MouseDragStart {
                             is_resize: false,
@@ -566,26 +561,10 @@ unsafe extern "system" fn low_level_mouse_proc(
                             y: ms.pt.y,
                         });
                     }
-                    if let Some(pacer) = st.pacer_control.get() {
-                        pacer.wake();
-                    }
                     return LRESULT(1);
-                }
-                WM_LBUTTONDOWN => {
-                    if st.dragging_move.swap(false, Ordering::SeqCst) {
-                        st.drag_dirty.store(false, Ordering::SeqCst);
-                        if let Some(tx) = st.dispatch_tx.get() {
-                            let _ = tx.send(Action::MouseDragEnd {
-                                is_resize: false,
-                                x: ms.pt.x,
-                                y: ms.pt.y,
-                            });
-                        }
-                    }
                 }
                 WM_LBUTTONUP => {
                     if st.dragging_move.swap(false, Ordering::SeqCst) {
-                        st.drag_dirty.store(false, Ordering::SeqCst);
                         if let Some(tx) = st.dispatch_tx.get() {
                             let _ = tx.send(Action::MouseDragEnd {
                                 is_resize: false,
@@ -598,12 +577,12 @@ unsafe extern "system" fn low_level_mouse_proc(
                 }
                 WM_RBUTTONDOWN if cur_super => {
                     st.super_chord_used.store(true, Ordering::SeqCst);
+                    suppress_windows_start_menu_tap();
                     st.drag_start_x.store(ms.pt.x, Ordering::SeqCst);
                     st.drag_start_y.store(ms.pt.y, Ordering::SeqCst);
                     st.drag_curr_x.store(ms.pt.x, Ordering::SeqCst);
                     st.drag_curr_y.store(ms.pt.y, Ordering::SeqCst);
                     st.dragging_resize.store(true, Ordering::SeqCst);
-                    st.drag_dirty.store(false, Ordering::SeqCst);
                     if let Some(tx) = st.dispatch_tx.get() {
                         let _ = tx.send(Action::MouseDragStart {
                             is_resize: true,
@@ -611,26 +590,10 @@ unsafe extern "system" fn low_level_mouse_proc(
                             y: ms.pt.y,
                         });
                     }
-                    if let Some(pacer) = st.pacer_control.get() {
-                        pacer.wake();
-                    }
                     return LRESULT(1);
-                }
-                WM_RBUTTONDOWN => {
-                    if st.dragging_resize.swap(false, Ordering::SeqCst) {
-                        st.drag_dirty.store(false, Ordering::SeqCst);
-                        if let Some(tx) = st.dispatch_tx.get() {
-                            let _ = tx.send(Action::MouseDragEnd {
-                                is_resize: true,
-                                x: ms.pt.x,
-                                y: ms.pt.y,
-                            });
-                        }
-                    }
                 }
                 WM_RBUTTONUP => {
                     if st.dragging_resize.swap(false, Ordering::SeqCst) {
-                        st.drag_dirty.store(false, Ordering::SeqCst);
                         if let Some(tx) = st.dispatch_tx.get() {
                             let _ = tx.send(Action::MouseDragEnd {
                                 is_resize: true,
@@ -642,62 +605,25 @@ unsafe extern "system" fn low_level_mouse_proc(
                     }
                 }
                 WM_MOUSEMOVE => {
-                    let mut is_move = st.dragging_move.load(Ordering::Relaxed);
-                    let mut is_resize = st.dragging_resize.load(Ordering::Relaxed);
-
-                    if is_move || is_resize {
-                        let lmb = (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0;
-                        let rmb = (GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16 & 0x8000) != 0;
-                        if is_move && !lmb {
-                            st.dragging_move.store(false, Ordering::SeqCst);
-                            st.drag_dirty.store(false, Ordering::SeqCst);
-                            if let Some(tx) = st.dispatch_tx.get() {
-                                let _ = tx.send(Action::MouseDragEnd {
-                                    is_resize: false,
-                                    x: ms.pt.x,
-                                    y: ms.pt.y,
-                                });
-                            }
-                            is_move = false;
-                        }
-                        if is_resize && !rmb {
-                            st.dragging_resize.store(false, Ordering::SeqCst);
-                            st.drag_dirty.store(false, Ordering::SeqCst);
-                            if let Some(tx) = st.dispatch_tx.get() {
-                                let _ = tx.send(Action::MouseDragEnd {
-                                    is_resize: true,
-                                    x: ms.pt.x,
-                                    y: ms.pt.y,
-                                });
-                            }
-                            is_resize = false;
-                        }
-                    }
-
+                    // IMPORTANT: Do NOT check GetAsyncKeyState(VK_LBUTTON / VK_RBUTTON) here!
+                    // Because WH_MOUSE_LL returns LRESULT(1) on WM_LBUTTONDOWN / WM_RBUTTONDOWN,
+                    // the Windows kernel drops the button press before updating GetAsyncKeyState,
+                    // so GetAsyncKeyState(VK_LBUTTON/VK_RBUTTON) is ALWAYS 0 during a Super+Mouse drag.
+                    let is_move = st.dragging_move.load(Ordering::Acquire);
+                    let is_resize = st.dragging_resize.load(Ordering::Acquire);
                     if is_move || is_resize {
                         st.drag_curr_x.store(ms.pt.x, Ordering::Relaxed);
                         st.drag_curr_y.store(ms.pt.y, Ordering::Relaxed);
-                        if st
-                            .drag_in_flight
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                            .is_ok()
-                        {
-                            let start_x = st.drag_start_x.load(Ordering::Relaxed);
-                            let start_y = st.drag_start_y.load(Ordering::Relaxed);
-                            if let Some(tx) = st.dispatch_tx.get() {
-                                let _ = tx.send(Action::MouseDragWindow {
-                                    is_resize,
-                                    start_x,
-                                    start_y,
-                                    curr_x: ms.pt.x,
-                                    curr_y: ms.pt.y,
-                                });
-                            }
-                        } else {
-                            st.drag_dirty.store(true, Ordering::Release);
-                        }
-                        if let Some(pacer) = st.pacer_control.get() {
-                            pacer.wake();
+                        let start_x = st.drag_start_x.load(Ordering::Relaxed);
+                        let start_y = st.drag_start_y.load(Ordering::Relaxed);
+                        if let Some(tx) = st.dispatch_tx.get() {
+                            let _ = tx.send(Action::MouseDragWindow {
+                                is_resize,
+                                start_x,
+                                start_y,
+                                curr_x: ms.pt.x,
+                                curr_y: ms.pt.y,
+                            });
                         }
                     }
                 }
@@ -860,13 +786,15 @@ fn main() -> Result<()> {
         }
     });
 
-    // Spawn worker thread for non-blocking IPC / process dispatch
+    // Spawn single-ordered worker thread for non-blocking IPC / process dispatch.
+    // All MouseDragStart -> MouseDragWindow -> MouseDragEnd events arrive through `rx` in strict FIFO order,
+    // and consecutive `MouseDragWindow` updates are coalesced in-place so the WM always receives the latest
+    // cursor coordinates with 0ms sleep latency and zero out-of-order stragglers.
     thread::Builder::new()
         .name("chickenwm-binds-dispatcher".to_string())
         .spawn(move || {
             let mut wm_client = PersistentIpcClient::new(PIPE_NAME_WM);
-            while let Ok(action) = rx.recv() {
-                let is_drag_update = matches!(action, Action::MouseDragWindow { .. });
+            let dispatch_one = |wm_client: &mut PersistentIpcClient, action: Action| {
                 let use_persistent_wm = matches!(
                     action,
                     Action::MouseDragStart { .. }
@@ -879,74 +807,26 @@ fn main() -> Result<()> {
                     if wm_client.send(&IpcCommand::Dispatch(action.clone())).is_err() {
                         execute_action(action);
                     }
-                    if is_drag_update {
-                        let st = state();
-                        // Immediately flush any newer cursor coordinates that arrived while the pipe
-                        // write was in flight, with zero sleep delay.
-                        while st.drag_dirty.swap(false, Ordering::AcqRel) {
-                            let is_resize = st.dragging_resize.load(Ordering::Acquire);
-                            let is_move = st.dragging_move.load(Ordering::Acquire);
-                            if !is_resize && !is_move {
-                                break;
-                            }
-                            let next_act = Action::MouseDragWindow {
-                                is_resize,
-                                start_x: st.drag_start_x.load(Ordering::Relaxed),
-                                start_y: st.drag_start_y.load(Ordering::Relaxed),
-                                curr_x: st.drag_curr_x.load(Ordering::Relaxed),
-                                curr_y: st.drag_curr_y.load(Ordering::Relaxed),
-                            };
-                            if wm_client.send(&IpcCommand::Dispatch(next_act.clone())).is_err() {
-                                execute_action(next_act);
-                                break;
-                            }
-                        }
-                        st.drag_in_flight.store(false, Ordering::Release);
-                        // Re-check once after clearing drag_in_flight in case a move arrived right before store(false)
-                        if st.drag_dirty.load(Ordering::Acquire) {
-                            if let Some(pacer) = st.pacer_control.get() {
-                                pacer.wake();
-                            }
-                        }
-                    }
                 } else {
                     execute_action(action);
                 }
-            }
-        })?;
+            };
 
-    // Phase 4.3: Spawn Low-Latency Mouse Resize/Move Stream (fallback wake pump)
-    let tx_mouse = tx.clone();
-    let pacer_mouse = Arc::clone(&pacer_control);
-    thread::Builder::new()
-        .name("chickenwm-binds-mouse-stream".to_string())
-        .spawn(move || {
-            loop {
-                pacer_mouse.wait_until_woken();
-                let st = state();
-                let is_resize = st.dragging_resize.load(Ordering::Acquire);
-                let active = is_resize || st.dragging_move.load(Ordering::Acquire);
-                if active
-                    && st
-                        .drag_in_flight
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    if st.drag_dirty.swap(false, Ordering::AcqRel) {
-                        let start_x = st.drag_start_x.load(Ordering::Relaxed);
-                        let start_y = st.drag_start_y.load(Ordering::Relaxed);
-                        let curr_x = st.drag_curr_x.load(Ordering::Relaxed);
-                        let curr_y = st.drag_curr_y.load(Ordering::Relaxed);
-                        let _ = tx_mouse.send(Action::MouseDragWindow {
-                            is_resize,
-                            start_x,
-                            start_y,
-                            curr_x,
-                            curr_y,
-                        });
-                    } else {
-                        st.drag_in_flight.store(false, Ordering::Release);
+            while let Ok(mut action) = rx.recv() {
+                let mut next_non_drag = None;
+                if matches!(action, Action::MouseDragWindow { .. }) {
+                    while let Ok(queued) = rx.try_recv() {
+                        if matches!(queued, Action::MouseDragWindow { .. }) {
+                            action = queued;
+                        } else {
+                            next_non_drag = Some(queued);
+                            break;
+                        }
                     }
+                }
+                dispatch_one(&mut wm_client, action);
+                if let Some(after) = next_non_drag {
+                    dispatch_one(&mut wm_client, after);
                 }
             }
         })?;
