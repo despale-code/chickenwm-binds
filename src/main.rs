@@ -99,6 +99,10 @@ struct HookState {
     drag_start_y: AtomicI32,
     drag_curr_x: AtomicI32,
     drag_curr_y: AtomicI32,
+    /// A Super+button press was swallowed without starting a drag (the other button was already
+    /// dragging); its matching button-up must be swallowed too so no app sees an unpaired release.
+    swallow_lup: AtomicBool,
+    swallow_rup: AtomicBool,
 
     binds: RwLock<Vec<CompiledBind>>,
     raw_rules: RwLock<Vec<BindRule>>,
@@ -526,6 +530,30 @@ unsafe extern "system" fn low_level_keyboard_proc(
     }
 }
 
+/// Starts a Super+LMB move (`is_resize = false`) or Super+RMB resize drag from the mouse hook.
+fn begin_hook_drag(st: &HookState, is_resize: bool, x: i32, y: i32) {
+    st.drag_start_x.store(x, Ordering::SeqCst);
+    st.drag_start_y.store(y, Ordering::SeqCst);
+    st.drag_curr_x.store(x, Ordering::SeqCst);
+    st.drag_curr_y.store(y, Ordering::SeqCst);
+    if is_resize {
+        st.dragging_resize.store(true, Ordering::SeqCst);
+    } else {
+        st.dragging_move.store(true, Ordering::SeqCst);
+    }
+    if let Some(tx) = st.dispatch_tx.get() {
+        let _ = tx.send(Action::MouseDragStart { is_resize, x, y });
+    }
+}
+
+/// Queues the end of a hook drag. Callers clear the matching `dragging_*` flag first (via `swap`)
+/// so exactly one `MouseDragEnd` is ever sent per drag.
+fn send_drag_end(st: &HookState, is_resize: bool, x: i32, y: i32) {
+    if let Some(tx) = st.dispatch_tx.get() {
+        let _ = tx.send(Action::MouseDragEnd { is_resize, x, y });
+    }
+}
+
 unsafe extern "system" fn low_level_mouse_proc(
     n_code: i32,
     w_param: WPARAM,
@@ -546,61 +574,60 @@ unsafe extern "system" fn low_level_mouse_proc(
             let cur_super = st.super_down.load(Ordering::Relaxed) || hw_super;
 
             match msg {
-                WM_LBUTTONDOWN if cur_super => {
-                    st.super_chord_used.store(true, Ordering::SeqCst);
-                    suppress_windows_start_menu_tap();
-                    st.drag_start_x.store(ms.pt.x, Ordering::SeqCst);
-                    st.drag_start_y.store(ms.pt.y, Ordering::SeqCst);
-                    st.drag_curr_x.store(ms.pt.x, Ordering::SeqCst);
-                    st.drag_curr_y.store(ms.pt.y, Ordering::SeqCst);
-                    st.dragging_move.store(true, Ordering::SeqCst);
-                    if let Some(tx) = st.dispatch_tx.get() {
-                        let _ = tx.send(Action::MouseDragStart {
-                            is_resize: false,
-                            x: ms.pt.x,
-                            y: ms.pt.y,
-                        });
-                    }
-                    return LRESULT(1);
-                }
-                WM_LBUTTONUP => {
+                WM_LBUTTONDOWN => {
+                    // A fresh press of a button we were already dragging with proves its release
+                    // was lost (input to an elevated window bypasses this non-elevated hook, or
+                    // Windows timed the hook out). End the stale drag before anything else.
+                    // NOTE: GetAsyncKeyState(VK_LBUTTON) can NOT be used for this: the swallowed
+                    // press never set the async key bit.
+                    st.swallow_lup.store(false, Ordering::SeqCst);
                     if st.dragging_move.swap(false, Ordering::SeqCst) {
-                        if let Some(tx) = st.dispatch_tx.get() {
-                            let _ = tx.send(Action::MouseDragEnd {
-                                is_resize: false,
-                                x: ms.pt.x,
-                                y: ms.pt.y,
-                            });
+                        send_drag_end(st, false, ms.pt.x, ms.pt.y);
+                    }
+                    if cur_super {
+                        st.super_chord_used.store(true, Ordering::SeqCst);
+                        suppress_windows_start_menu_tap();
+                        if st.dragging_resize.load(Ordering::SeqCst) {
+                            // Already resizing with RMB: eat this press (and its release) without
+                            // starting a second, overlapping drag session.
+                            st.swallow_lup.store(true, Ordering::SeqCst);
+                            return LRESULT(1);
                         }
+                        begin_hook_drag(st, false, ms.pt.x, ms.pt.y);
                         return LRESULT(1);
                     }
                 }
-                WM_RBUTTONDOWN if cur_super => {
-                    st.super_chord_used.store(true, Ordering::SeqCst);
-                    suppress_windows_start_menu_tap();
-                    st.drag_start_x.store(ms.pt.x, Ordering::SeqCst);
-                    st.drag_start_y.store(ms.pt.y, Ordering::SeqCst);
-                    st.drag_curr_x.store(ms.pt.x, Ordering::SeqCst);
-                    st.drag_curr_y.store(ms.pt.y, Ordering::SeqCst);
-                    st.dragging_resize.store(true, Ordering::SeqCst);
-                    if let Some(tx) = st.dispatch_tx.get() {
-                        let _ = tx.send(Action::MouseDragStart {
-                            is_resize: true,
-                            x: ms.pt.x,
-                            y: ms.pt.y,
-                        });
+                WM_LBUTTONUP => {
+                    if st.dragging_move.swap(false, Ordering::SeqCst) {
+                        send_drag_end(st, false, ms.pt.x, ms.pt.y);
+                        return LRESULT(1);
                     }
-                    return LRESULT(1);
+                    if st.swallow_lup.swap(false, Ordering::SeqCst) {
+                        return LRESULT(1);
+                    }
+                }
+                WM_RBUTTONDOWN => {
+                    st.swallow_rup.store(false, Ordering::SeqCst);
+                    if st.dragging_resize.swap(false, Ordering::SeqCst) {
+                        send_drag_end(st, true, ms.pt.x, ms.pt.y);
+                    }
+                    if cur_super {
+                        st.super_chord_used.store(true, Ordering::SeqCst);
+                        suppress_windows_start_menu_tap();
+                        if st.dragging_move.load(Ordering::SeqCst) {
+                            st.swallow_rup.store(true, Ordering::SeqCst);
+                            return LRESULT(1);
+                        }
+                        begin_hook_drag(st, true, ms.pt.x, ms.pt.y);
+                        return LRESULT(1);
+                    }
                 }
                 WM_RBUTTONUP => {
                     if st.dragging_resize.swap(false, Ordering::SeqCst) {
-                        if let Some(tx) = st.dispatch_tx.get() {
-                            let _ = tx.send(Action::MouseDragEnd {
-                                is_resize: true,
-                                x: ms.pt.x,
-                                y: ms.pt.y,
-                            });
-                        }
+                        send_drag_end(st, true, ms.pt.x, ms.pt.y);
+                        return LRESULT(1);
+                    }
+                    if st.swallow_rup.swap(false, Ordering::SeqCst) {
                         return LRESULT(1);
                     }
                 }
@@ -861,6 +888,31 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use chickenwm_core::config::{ConfigDocument, DEFAULT_CHICKENWM_CONF};
+
+    #[test]
+    fn hook_drag_helpers_emit_one_start_and_one_end_per_drag() {
+        let st = HookState::default();
+        let (tx, rx) = unbounded::<Action>();
+        let _ = st.dispatch_tx.set(tx);
+
+        begin_hook_drag(&st, true, 10, 20);
+        assert!(st.dragging_resize.load(Ordering::SeqCst));
+        assert!(!st.dragging_move.load(Ordering::SeqCst));
+        assert_eq!(st.drag_start_x.load(Ordering::SeqCst), 10);
+        assert_eq!(st.drag_start_y.load(Ordering::SeqCst), 20);
+
+        // Release path: the flag is swapped off first, so a duplicate release sends nothing.
+        for _ in 0..2 {
+            if st.dragging_resize.swap(false, Ordering::SeqCst) {
+                send_drag_end(&st, true, 30, 40);
+            }
+        }
+
+        let sent: Vec<Action> = rx.try_iter().collect();
+        assert_eq!(sent.len(), 2);
+        assert!(matches!(sent[0], Action::MouseDragStart { is_resize: true, x: 10, y: 20 }));
+        assert!(matches!(sent[1], Action::MouseDragEnd { is_resize: true, x: 30, y: 40 }));
+    }
 
     #[test]
     fn compile_binds_parses_chain_chords_and_modal_layers() {
