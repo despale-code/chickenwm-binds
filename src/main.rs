@@ -348,10 +348,9 @@ unsafe extern "system" fn low_level_keyboard_proc(
                     st.super_chord_used.store(false, Ordering::SeqCst);
                 } else if is_up {
                     st.super_down.store(false, Ordering::SeqCst);
-                    if !st.super_chord_used.load(Ordering::SeqCst) {
-                        // Consume standalone Win key tap so Start Menu does not steal focus
-                        suppress_windows_start_menu_tap();
-                    }
+                    // Always suppress the Windows Start Menu on Win key release so neither
+                    // standalone taps nor Super+Mouse drags ever pop up Start Menu.
+                    suppress_windows_start_menu_tap();
                 }
                 return CallNextHookEx(None, n_code, w_param, l_param);
             }
@@ -381,10 +380,23 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 || (GetAsyncKeyState(VK_LSHIFT.0 as i32) as u16 & 0x8000) != 0
                 || (GetAsyncKeyState(VK_RSHIFT.0 as i32) as u16 & 0x8000) != 0;
 
-            let cur_super = st.super_down.load(Ordering::Relaxed) || hw_super;
-            let cur_ctrl = st.ctrl_down.load(Ordering::Relaxed) || hw_ctrl;
-            let cur_alt = st.alt_down.load(Ordering::Relaxed) || hw_alt;
-            let cur_shift = st.shift_down.load(Ordering::Relaxed) || hw_shift;
+            if !hw_super {
+                st.super_down.store(false, Ordering::SeqCst);
+            }
+            if !hw_ctrl {
+                st.ctrl_down.store(false, Ordering::SeqCst);
+            }
+            if !hw_alt {
+                st.alt_down.store(false, Ordering::SeqCst);
+            }
+            if !hw_shift {
+                st.shift_down.store(false, Ordering::SeqCst);
+            }
+
+            let cur_super = hw_super;
+            let cur_ctrl = hw_ctrl;
+            let cur_alt = hw_alt;
+            let cur_shift = hw_shift;
 
             // Normalize numpad 0..9 (0x60..=0x69) to top-row 0..9 (0x30..=0x39) for matching
             let normalized_vk = if (0x60..=0x69).contains(&vk) {
@@ -533,18 +545,20 @@ unsafe extern "system" fn low_level_mouse_proc(
             };
             let hw_super = (GetAsyncKeyState(VK_LWIN.0 as i32) as u16 & 0x8000) != 0
                 || (GetAsyncKeyState(VK_RWIN.0 as i32) as u16 & 0x8000) != 0;
-            let cur_super = st.super_down.load(Ordering::Relaxed) || hw_super;
+            if !hw_super {
+                st.super_down.store(false, Ordering::SeqCst);
+            }
+            let cur_super = hw_super;
 
             match msg {
                 WM_LBUTTONDOWN if cur_super => {
                     st.super_chord_used.store(true, Ordering::SeqCst);
-                    suppress_windows_start_menu_tap();
                     st.drag_start_x.store(ms.pt.x, Ordering::SeqCst);
                     st.drag_start_y.store(ms.pt.y, Ordering::SeqCst);
                     st.drag_curr_x.store(ms.pt.x, Ordering::SeqCst);
                     st.drag_curr_y.store(ms.pt.y, Ordering::SeqCst);
                     st.dragging_move.store(true, Ordering::SeqCst);
-                    st.drag_dirty.store(true, Ordering::SeqCst);
+                    st.drag_dirty.store(false, Ordering::SeqCst);
                     if let Some(tx) = st.dispatch_tx.get() {
                         let _ = tx.send(Action::MouseDragStart {
                             is_resize: false,
@@ -557,8 +571,21 @@ unsafe extern "system" fn low_level_mouse_proc(
                     }
                     return LRESULT(1);
                 }
+                WM_LBUTTONDOWN => {
+                    if st.dragging_move.swap(false, Ordering::SeqCst) {
+                        st.drag_dirty.store(false, Ordering::SeqCst);
+                        if let Some(tx) = st.dispatch_tx.get() {
+                            let _ = tx.send(Action::MouseDragEnd {
+                                is_resize: false,
+                                x: ms.pt.x,
+                                y: ms.pt.y,
+                            });
+                        }
+                    }
+                }
                 WM_LBUTTONUP => {
                     if st.dragging_move.swap(false, Ordering::SeqCst) {
+                        st.drag_dirty.store(false, Ordering::SeqCst);
                         if let Some(tx) = st.dispatch_tx.get() {
                             let _ = tx.send(Action::MouseDragEnd {
                                 is_resize: false,
@@ -571,13 +598,12 @@ unsafe extern "system" fn low_level_mouse_proc(
                 }
                 WM_RBUTTONDOWN if cur_super => {
                     st.super_chord_used.store(true, Ordering::SeqCst);
-                    suppress_windows_start_menu_tap();
                     st.drag_start_x.store(ms.pt.x, Ordering::SeqCst);
                     st.drag_start_y.store(ms.pt.y, Ordering::SeqCst);
                     st.drag_curr_x.store(ms.pt.x, Ordering::SeqCst);
                     st.drag_curr_y.store(ms.pt.y, Ordering::SeqCst);
                     st.dragging_resize.store(true, Ordering::SeqCst);
-                    st.drag_dirty.store(true, Ordering::SeqCst);
+                    st.drag_dirty.store(false, Ordering::SeqCst);
                     if let Some(tx) = st.dispatch_tx.get() {
                         let _ = tx.send(Action::MouseDragStart {
                             is_resize: true,
@@ -590,8 +616,21 @@ unsafe extern "system" fn low_level_mouse_proc(
                     }
                     return LRESULT(1);
                 }
+                WM_RBUTTONDOWN => {
+                    if st.dragging_resize.swap(false, Ordering::SeqCst) {
+                        st.drag_dirty.store(false, Ordering::SeqCst);
+                        if let Some(tx) = st.dispatch_tx.get() {
+                            let _ = tx.send(Action::MouseDragEnd {
+                                is_resize: true,
+                                x: ms.pt.x,
+                                y: ms.pt.y,
+                            });
+                        }
+                    }
+                }
                 WM_RBUTTONUP => {
                     if st.dragging_resize.swap(false, Ordering::SeqCst) {
+                        st.drag_dirty.store(false, Ordering::SeqCst);
                         if let Some(tx) = st.dispatch_tx.get() {
                             let _ = tx.send(Action::MouseDragEnd {
                                 is_resize: true,
@@ -606,45 +645,57 @@ unsafe extern "system" fn low_level_mouse_proc(
                     let mut is_move = st.dragging_move.load(Ordering::Relaxed);
                     let mut is_resize = st.dragging_resize.load(Ordering::Relaxed);
 
-                    // Auto-recover if Super + LMB/RMB is held during move but button-down was before Super
-                    if !is_move && !is_resize && cur_super {
+                    if is_move || is_resize {
                         let lmb = (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0;
                         let rmb = (GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16 & 0x8000) != 0;
-                        if lmb {
-                            st.super_chord_used.store(true, Ordering::SeqCst);
-                            suppress_windows_start_menu_tap();
-                            st.drag_start_x.store(ms.pt.x, Ordering::SeqCst);
-                            st.drag_start_y.store(ms.pt.y, Ordering::SeqCst);
-                            st.dragging_move.store(true, Ordering::SeqCst);
-                            is_move = true;
+                        if is_move && !lmb {
+                            st.dragging_move.store(false, Ordering::SeqCst);
+                            st.drag_dirty.store(false, Ordering::SeqCst);
                             if let Some(tx) = st.dispatch_tx.get() {
-                                let _ = tx.send(Action::MouseDragStart {
+                                let _ = tx.send(Action::MouseDragEnd {
                                     is_resize: false,
                                     x: ms.pt.x,
                                     y: ms.pt.y,
                                 });
                             }
-                        } else if rmb {
-                            st.super_chord_used.store(true, Ordering::SeqCst);
-                            suppress_windows_start_menu_tap();
-                            st.drag_start_x.store(ms.pt.x, Ordering::SeqCst);
-                            st.drag_start_y.store(ms.pt.y, Ordering::SeqCst);
-                            st.dragging_resize.store(true, Ordering::SeqCst);
-                            is_resize = true;
+                            is_move = false;
+                        }
+                        if is_resize && !rmb {
+                            st.dragging_resize.store(false, Ordering::SeqCst);
+                            st.drag_dirty.store(false, Ordering::SeqCst);
                             if let Some(tx) = st.dispatch_tx.get() {
-                                let _ = tx.send(Action::MouseDragStart {
+                                let _ = tx.send(Action::MouseDragEnd {
                                     is_resize: true,
                                     x: ms.pt.x,
                                     y: ms.pt.y,
                                 });
                             }
+                            is_resize = false;
                         }
                     }
 
                     if is_move || is_resize {
                         st.drag_curr_x.store(ms.pt.x, Ordering::Relaxed);
                         st.drag_curr_y.store(ms.pt.y, Ordering::Relaxed);
-                        st.drag_dirty.store(true, Ordering::Release);
+                        if st
+                            .drag_in_flight
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            let start_x = st.drag_start_x.load(Ordering::Relaxed);
+                            let start_y = st.drag_start_y.load(Ordering::Relaxed);
+                            if let Some(tx) = st.dispatch_tx.get() {
+                                let _ = tx.send(Action::MouseDragWindow {
+                                    is_resize,
+                                    start_x,
+                                    start_y,
+                                    curr_x: ms.pt.x,
+                                    curr_y: ms.pt.y,
+                                });
+                            }
+                        } else {
+                            st.drag_dirty.store(true, Ordering::Release);
+                        }
                         if let Some(pacer) = st.pacer_control.get() {
                             pacer.wake();
                         }
@@ -830,9 +881,32 @@ fn main() -> Result<()> {
                     }
                     if is_drag_update {
                         let st = state();
+                        // Immediately flush any newer cursor coordinates that arrived while the pipe
+                        // write was in flight, with zero sleep delay.
+                        while st.drag_dirty.swap(false, Ordering::AcqRel) {
+                            let is_resize = st.dragging_resize.load(Ordering::Acquire);
+                            let is_move = st.dragging_move.load(Ordering::Acquire);
+                            if !is_resize && !is_move {
+                                break;
+                            }
+                            let next_act = Action::MouseDragWindow {
+                                is_resize,
+                                start_x: st.drag_start_x.load(Ordering::Relaxed),
+                                start_y: st.drag_start_y.load(Ordering::Relaxed),
+                                curr_x: st.drag_curr_x.load(Ordering::Relaxed),
+                                curr_y: st.drag_curr_y.load(Ordering::Relaxed),
+                            };
+                            if wm_client.send(&IpcCommand::Dispatch(next_act.clone())).is_err() {
+                                execute_action(next_act);
+                                break;
+                            }
+                        }
                         st.drag_in_flight.store(false, Ordering::Release);
-                        if let Some(pacer) = st.pacer_control.get() {
-                            pacer.wake();
+                        // Re-check once after clearing drag_in_flight in case a move arrived right before store(false)
+                        if st.drag_dirty.load(Ordering::Acquire) {
+                            if let Some(pacer) = st.pacer_control.get() {
+                                pacer.wake();
+                            }
                         }
                     }
                 } else {
@@ -841,49 +915,38 @@ fn main() -> Result<()> {
             }
         })?;
 
-    // Phase 4.3: Spawn Low-Latency Mouse Resize/Move Stream
+    // Phase 4.3: Spawn Low-Latency Mouse Resize/Move Stream (fallback wake pump)
     let tx_mouse = tx.clone();
     let pacer_mouse = Arc::clone(&pacer_control);
     thread::Builder::new()
         .name("chickenwm-binds-mouse-stream".to_string())
         .spawn(move || {
             loop {
+                pacer_mouse.wait_until_woken();
                 let st = state();
-                let is_move = st.dragging_move.load(Ordering::Relaxed);
-                let is_resize = st.dragging_resize.load(Ordering::Relaxed);
-                let active = is_move || is_resize;
-
-                if !active {
-                    pacer_mouse.wait_until_woken();
-                } else if st.drag_in_flight.load(Ordering::Acquire)
-                    || !st.drag_dirty.load(Ordering::Acquire)
-                {
-                    thread::sleep(std::time::Duration::from_millis(1));
-                }
-
-                // Re-read: the button may have been released meanwhile, and
-                // an update sent after MouseDragEnd would reach the WM as a stale straggler.
                 let is_resize = st.dragging_resize.load(Ordering::Acquire);
                 let active = is_resize || st.dragging_move.load(Ordering::Acquire);
                 if active
-                    && !st.drag_in_flight.load(Ordering::Acquire)
-                    && st.drag_dirty.swap(false, Ordering::AcqRel)
+                    && st
+                        .drag_in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
                 {
-                    // `start_*` stays fixed for the whole drag: the WM computes geometry from the
-                    // total offset, so a coalesced or lost update can never desync the window.
-                    let start_x = st.drag_start_x.load(Ordering::Relaxed);
-                    let start_y = st.drag_start_y.load(Ordering::Relaxed);
-                    let curr_x = st.drag_curr_x.load(Ordering::Relaxed);
-                    let curr_y = st.drag_curr_y.load(Ordering::Relaxed);
-
-                    st.drag_in_flight.store(true, Ordering::Release);
-                    let _ = tx_mouse.send(Action::MouseDragWindow {
-                        is_resize,
-                        start_x,
-                        start_y,
-                        curr_x,
-                        curr_y,
-                    });
+                    if st.drag_dirty.swap(false, Ordering::AcqRel) {
+                        let start_x = st.drag_start_x.load(Ordering::Relaxed);
+                        let start_y = st.drag_start_y.load(Ordering::Relaxed);
+                        let curr_x = st.drag_curr_x.load(Ordering::Relaxed);
+                        let curr_y = st.drag_curr_y.load(Ordering::Relaxed);
+                        let _ = tx_mouse.send(Action::MouseDragWindow {
+                            is_resize,
+                            start_x,
+                            start_y,
+                            curr_x,
+                            curr_y,
+                        });
+                    } else {
+                        st.drag_in_flight.store(false, Ordering::Release);
+                    }
                 }
             }
         })?;
