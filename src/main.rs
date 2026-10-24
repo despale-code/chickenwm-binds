@@ -17,7 +17,7 @@ use chickenwm_core::bootstrap_config_and_themes;
 use chickenwm_core::config::{load_or_init_config, BindKind, BindRule, HyprConfig};
 use chickenwm_core::css::{spawn_config_watcher, ConfigWatchEvent};
 use chickenwm_core::failsafe::{spawn_emergency_failsafe_thread, trigger_emergency_restore};
-use chickenwm_core::frame_scheduler::{AdaptiveFrameScheduler, FramePacerControl};
+use chickenwm_core::frame_scheduler::FramePacerControl;
 use chickenwm_core::handles::SafeHhook;
 use chickenwm_core::init_tracing;
 use chickenwm_core::ipc::{
@@ -25,7 +25,6 @@ use chickenwm_core::ipc::{
     PIPE_NAME_LAUNCHER, PIPE_NAME_NOTIFY, PIPE_NAME_WM,
 };
 use parking_lot::RwLock;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -657,15 +656,6 @@ unsafe extern "system" fn low_level_mouse_proc(
 
         CallNextHookEx(None, n_code, w_param, l_param)
     }
-}
-
-/// Launches `target` with `params`. When ChickenWM is elevated, de-elevates so apps
-/// run with standard user privileges.
-fn shell_open(target: &str, params: &str) -> bool {
-    let target_path = std::path::Path::new(target);
-    let args = if params.trim().is_empty() { None } else { Some(params) };
-    chickenwm_core::elevation::shell_open_unelevated(target_path, args, None);
-    true
 }
 
 fn resolve_program_path(program: &str) -> std::path::PathBuf {
